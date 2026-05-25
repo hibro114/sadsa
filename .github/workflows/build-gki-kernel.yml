@@ -247,8 +247,8 @@ jobs:
       # -----------------------------------------------------------------------
       # Phase 6: Prepare Config Fragment & Build
       # -----------------------------------------------------------------------
-      - name: Prepare kernel config fragment
-        timeout-minutes: 5
+      - name: Prepare kernel config fragment & fix BUILD.bazel
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           KERNEL_WORK="${{ github.workspace }}/kernel-work"
@@ -266,6 +266,61 @@ jobs:
             if [[ -f "$KERNEL_WORK/common/BUILD.bazel" ]]; then
               perl -0pi -e 's/\n\s*"protected_exports_list"\s*:\s*"android\/abi_gki_protected_exports_aarch64",//g' "$KERNEL_WORK/common/BUILD.bazel"
             fi
+          fi
+
+          # Preemptively add common netfilter/ipset modules to BUILD.bazel that our
+          # config may produce. This avoids the "undeclared modules" build error.
+          echo "==> Patching BUILD.bazel to declare additional modules..."
+          BUILD_BAZEL="$KERNEL_WORK/common/BUILD.bazel"
+          if [[ -f "$BUILD_BAZEL" ]]; then
+            # Install buildozer for programmatic BUILD file edits
+            if ! command -v buildozer &>/dev/null; then
+              echo "    Installing buildozer..."
+              curl -fsSL "https://github.com/bazelbuild/buildtools/releases/download/v7.3.1/buildozer-linux-amd64" \
+                -o /usr/local/bin/buildozer
+              chmod +x /usr/local/bin/buildozer
+            fi
+
+            # Declare modules that ipset/netfilter/BBG may produce when enabled.
+            # These are safe to add even if they don't get built; Kleaf will just
+            # skip them if the corresponding CONFIG option is disabled.
+            EXTRA_MODULES=(
+              # IPSet
+              "net/netfilter/ipset/ip_set.ko"
+              "net/netfilter/ipset/ip_set_bitmap_ip.ko"
+              "net/netfilter/ipset/ip_set_bitmap_ipmac.ko"
+              "net/netfilter/ipset/ip_set_bitmap_port.ko"
+              "net/netfilter/ipset/ip_set_hash_ip.ko"
+              "net/netfilter/ipset/ip_set_hash_ipmark.ko"
+              "net/netfilter/ipset/ip_set_hash_ipport.ko"
+              "net/netfilter/ipset/ip_set_hash_ipportip.ko"
+              "net/netfilter/ipset/ip_set_hash_ipportnet.ko"
+              "net/netfilter/ipset/ip_set_hash_ipmac.ko"
+              "net/netfilter/ipset/ip_set_hash_mac.ko"
+              "net/netfilter/ipset/ip_set_hash_net.ko"
+              "net/netfilter/ipset/ip_set_hash_netnet.ko"
+              "net/netfilter/ipset/ip_set_hash_netport.ko"
+              "net/netfilter/ipset/ip_set_hash_netportnet.ko"
+              "net/netfilter/ipset/ip_set_hash_netiface.ko"
+              "net/netfilter/ipset/ip_set_list_set.ko"
+              # XT matches/targets
+              "net/netfilter/xt_set.ko"
+              "net/netfilter/xt_addrtype.ko"
+              "net/netfilter/xt_recent.ko"
+              "net/netfilter/xt_LOG.ko"
+              # IPv6 NAT
+              "net/ipv6/netfilter/nf_nat_ipv6.ko"
+              "net/ipv6/netfilter/ip6t_MASQUERADE.ko"
+              "net/ipv6/netfilter/ip6table_nat.ko"
+              # BBG
+              "security/baseband_guard/baseband_guard.ko"
+            )
+
+            echo "    Adding ${#EXTRA_MODULES[@]} extra module declarations..."
+            for mod in "${EXTRA_MODULES[@]}"; do
+              buildozer "add module_outs $mod" //common:kernel_aarch64 2>/dev/null || true
+            done
+            echo "    BUILD.bazel updated."
           fi
 
       - name: Build GKI kernel with Bazel
@@ -289,7 +344,7 @@ jobs:
 
           JOBS=$(nproc)
           if [[ "$JOBS" -gt 4 ]]; then
-            JOBS=4  # Limit to avoid OOM on GitHub Actions
+            JOBS=4
           fi
 
           set +e
@@ -311,11 +366,21 @@ jobs:
             df -h || true
             free -h || true
 
-            # Dump Bazel logs if any
-            find . -path '*/bazel-out/*' -type f \( -name '*.log' -o -name '*.err' \) -print -exec tail -200 {} \; 2>/dev/null | head -500 || true
+            # Extract actual compilation errors from the log
+            echo "==> Compilation errors found in log:"
+            grep -E '(error:|undefined reference|fatal error|Error:|ERROR:)' "$OUT_DIR/bazel-build.log" | tail -80 || true
 
+            echo ""
+            echo "==> Patch rejects (if any):"
+            find "$KERNEL_WORK" -name '*.rej' -print -exec cat {} \; 2>/dev/null || echo "  (none)"
+
+            echo ""
             echo "==> Tail of build log:"
             tail -200 "$OUT_DIR/bazel-build.log" || true
+
+            echo ""
+            echo "==> Checking for undeclared modules:"
+            grep -A 30 "remaining_ko_files\|module_outs\|not copied" "$OUT_DIR/bazel-build.log" || echo "  (not a module declaration issue)"
 
             exit 1
           fi
