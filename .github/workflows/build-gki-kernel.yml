@@ -1,0 +1,428 @@
+name: Build GKI Kernel - SukiSU Ultra + SUSFS 2.0 + BBG
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_tag:
+        description: 'Kernel tag to build'
+        required: true
+        default: 'android15-6.6.89_r00'
+      sukisu_ref:
+        description: 'SukiSU branch/tag'
+        required: true
+        default: 'main'
+      susfs_commit:
+        description: 'SUSFS commit hash'
+        required: true
+        default: '2df41de789026a6422521606402576507c687435'
+  push:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/build-gki-kernel.yml'
+      - 'config/**'
+      - 'scripts/**'
+
+env:
+  TARGET_RELEASE: "6.6.89-android15-8-g0889fe95bb10-ab14402178-4k"
+  KERNEL_MANIFEST_BRANCH: "common-android15-6.6-2025-05"
+  KERNEL_TAG: "android15-6.6.89_r00"
+  SUKISU_REF: "main"
+  SUSFS_REPO: "https://gitlab.com/simonpunk/susfs4ksu.git"
+  SUSFS_BRANCH: "gki-android15-6.6"
+  SUSFS_COMMIT: "2df41de789026a6422521606402576507c687435"
+  OUT_DIR: "${{ github.workspace }}/kernel-out"
+
+jobs:
+  build:
+    name: Build GKI Kernel (android15-6.6)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Phase 1: Environment Setup & Disk Space
+      # -----------------------------------------------------------------------
+      - name: Free disk space & install dependencies
+        run: |
+          echo "==> Disk space before cleanup:"
+          df -h /
+
+          # Remove large unused packages to free space
+          sudo apt-get remove -y --purge \
+            '^dotnet-.*' \
+            '^llvm-.*' \
+            '^php.*' \
+            '^mongodb-.*' \
+            '^mysql-.*' \
+            '^postgresql-.*' \
+            azure-cli \
+            google-chrome-stable \
+            firefox \
+            microsoft-edge-stable \
+            || true
+          sudo apt-get autoremove -y || true
+          sudo apt-get clean || true
+
+          # Remove large directories
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache 2>/dev/null || true
+          sudo rm -rf /imagegeneration 2>/dev/null || true
+
+          echo "==> Disk space after cleanup:"
+          df -h /
+
+          # Install build deps
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            git curl wget python3 python3-dev build-essential \
+            flex bison bc libssl-dev rsync cpio \
+            libncurses-dev libelf-dev ccache \
+            patch sed perl make xz-utils unzip \
+            ca-certificates gnupg
+
+          # Install repo tool
+          mkdir -p ~/bin
+          curl -fsSL "https://storage.googleapis.com/git-repo-downloads/repo" -o ~/bin/repo
+          chmod +x ~/bin/repo
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      # -----------------------------------------------------------------------
+      # Phase 2: Sync Android Kernel Source
+      # -----------------------------------------------------------------------
+      - name: Sync kernel source via repo
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          KERNEL_WORK="${{ github.workspace }}/kernel-work"
+          mkdir -p "$KERNEL_WORK"
+
+          cd "$KERNEL_WORK"
+
+          echo "==> Initializing repo manifest (branch: $KERNEL_MANIFEST_BRANCH)..."
+          repo init -u https://android.googlesource.com/kernel/manifest \
+            -b "$KERNEL_MANIFEST_BRANCH" --depth=1
+
+          echo "==> Syncing kernel sources..."
+          repo sync -c --current-branch --no-clone-bundle --no-tags -j$(nproc)
+
+          echo "==> Disk space after sync:"
+          df -h /
+
+          # Checkout exact kernel tag
+          cd "$KERNEL_WORK/common"
+          echo "==> Fetching kernel tag: $KERNEL_TAG"
+          git fetch --depth=1 https://android.googlesource.com/kernel/common \
+            "refs/tags/$KERNEL_TAG:refs/tags/$KERNEL_TAG"
+          git checkout -f "$KERNEL_TAG"
+
+          # Free space: remove .repo after successful sync
+          cd "$KERNEL_WORK"
+          rm -rf .repo .repo_.temp 2>/dev/null || true
+          echo "==> Disk space after removing .repo:"
+          df -h /
+
+      # -----------------------------------------------------------------------
+      # Phase 3: Install SukiSU Kernel Source
+      # -----------------------------------------------------------------------
+      - name: Install SukiSU Ultra kernel source
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          KERNEL_WORK="${{ github.workspace }}/kernel-work"
+          cd "$KERNEL_WORK"
+
+          SUKISU_REF="${{ inputs.sukisu_ref || env.SUKISU_REF }}"
+
+          echo "==> Installing SukiSU kernel source (ref: $SUKISU_REF)..."
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/$SUKISU_REF/kernel/setup.sh" \
+            | bash -s "$SUKISU_REF"
+
+          echo "==> SukiSU installed at: $KERNEL_WORK/KernelSU"
+          ls -la "$KERNEL_WORK/KernelSU/"
+
+      # -----------------------------------------------------------------------
+      # Phase 4: Clone & Apply SUSFS 2.0 Patches
+      # -----------------------------------------------------------------------
+      - name: Apply SUSFS 2.0 patches
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          KERNEL_WORK="${{ github.workspace }}/kernel-work"
+          cd "$KERNEL_WORK"
+
+          echo "==> Cloning SUSFS 2.0..."
+          git clone --depth=1 -b "$SUSFS_BRANCH" "$SUSFS_REPO" susfs4ksu
+          git -C susfs4ksu fetch --depth=1 origin "$SUSFS_COMMIT"
+          git -C susfs4ksu checkout -f "$SUSFS_COMMIT"
+
+          # ---- Patch KernelSU ----
+          echo "==> Applying SUSFS patch to SukiSU kernel code..."
+          cp susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
+
+          cd KernelSU
+
+          # Clean up UTS spoofing code that conflicts with SUSFS inline hooks
+          if [[ -f kernel/core/init.c ]]; then
+            echo "    Cleaning UTS spoofing from init.c..."
+            sed -i '/^#include "feature\/uts_spoof.h"$/d' kernel/core/init.c 2>/dev/null || true
+            perl -0pi -e 's/\nstatic char \*spoof_release = NULL;\nmodule_param\(spoof_release, charp, 0\);\n\nstatic char \*spoof_version = NULL;\nmodule_param\(spoof_version, charp, 0\);\n/\n/s' kernel/core/init.c 2>/dev/null || true
+            perl -0pi -e 's/\n    if \(spoof_release \|\| spoof_version\) \{\n        ksu_spoof_version\(spoof_release, spoof_version\);\n    \}\n/\n/s' kernel/core/init.c 2>/dev/null || true
+          fi
+
+          echo "    Applying SUSFS patch to KernelSU..."
+          if ! patch -p1 < 10_enable_susfs_for_ksu.patch; then
+            echo "    [WARNING] Patch had rejections, attempting fixups..."
+            if [[ -f kernel/core/init.c.rej ]]; then
+              perl -0pi -e 's/\n    ksu_init_symbol_resolver\(\);.*?\n    return 0;/\n#ifdef CONFIG_KSU_SUSFS\n    susfs_init();\n#endif \/\/ #ifdef KSU_SUSFS\n\n    ksu_feature_init();\n\n    ksu_supercalls_init();\n\n    ksu_sucompat_init();\n\n    ksu_setuid_hook_init();\n\n    ksu_sulog_init();\n\n    ksu_adb_root_init();\n\n    ksu_selinux_hide_init();\n\n    ksu_allowlist_init();\n\n    ksu_throne_tracker_init();\n\n    ksu_ksud_init();\n\n    ksu_file_wrapper_init();\n\n    return 0;/s' kernel/core/init.c 2>/dev/null || true
+              rm -f kernel/core/init.c.rej
+            fi
+
+            if find kernel -name '*.rej' -print -quit | grep -q .; then
+              echo "ERROR: Unresolved patch rejects:" >&2
+              find kernel -name '*.rej' -print >&2
+              exit 1
+            fi
+          fi
+
+          # Fix exit hooks
+          if [[ -f kernel/core/init.c ]]; then
+            echo "    Fixing exit hooks in init.c..."
+            perl -0pi -e 's/\n    \/\/ Phase 1: Stop all hooks first to prevent new callbacks\n    ksu_syscall_hook_manager_exit\(\);\n/\n/s' kernel/core/init.c 2>/dev/null || true
+            perl -0pi -e 's/\n    if \(!ksu_late_loaded\)\n        ksu_ksud_exit\(\);\n/\n    ksu_ksud_exit();\n/s' kernel/core/init.c 2>/dev/null || true
+          fi
+
+          cd "$KERNEL_WORK"
+
+          # __weak attribute fix for selinux_hide.c
+          echo "==> Applying __weak attribute fix for Clang..."
+          for _shide in KernelSU/kernel/feature/selinux_hide.c \
+                         common/drivers/kernelsu/feature/selinux_hide.c; do
+            if [[ -f "$_shide" ]]; then
+              sed -i 's/extern void security_dump_masked_av_fn/extern __weak void security_dump_masked_av_fn/g' "$_shide"
+              sed -i 's/extern void context_struct_compute_av_fn/extern __weak void context_struct_compute_av_fn/g' "$_shide"
+              echo "    Patched: $_shide"
+            fi
+          done
+
+          # ---- Patch Android Common Kernel ----
+          echo "==> Applying SUSFS patches to Android common kernel..."
+          cp susfs4ksu/kernel_patches/fs/* common/fs/ 2>/dev/null || true
+          cp susfs4ksu/kernel_patches/include/linux/* common/include/linux/ 2>/dev/null || true
+          cp susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch common/
+
+          cd common
+          # Add dma-buf.h include if needed for proc/base.c
+          if grep -q "cpufreq_times.h" fs/proc/base.c 2>/dev/null; then
+            sed -i '/^#include <linux\/cpufreq_times.h>$/a #include <linux/dma-buf.h>' fs/proc/base.c
+            patch -p1 < 50_add_susfs_in_gki-android15-6.6.patch
+            sed -i '/^#include <linux\/dma-buf.h>$/d' fs/proc/base.c
+          else
+            patch -p1 < 50_add_susfs_in_gki-android15-6.6.patch
+          fi
+
+          cd "$KERNEL_WORK"
+          echo "==> SUSFS 2.0 patches applied successfully."
+
+      # -----------------------------------------------------------------------
+      # Phase 5: Install Baseband Guard (BBG)
+      # -----------------------------------------------------------------------
+      - name: Install Baseband Guard
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          KERNEL_WORK="${{ github.workspace }}/kernel-work"
+          cd "$KERNEL_WORK"
+
+          echo "==> Installing Baseband Guard..."
+          curl -fsSL "https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh" | bash
+
+          echo "==> Configuring BBG in LSM stack..."
+          sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' \
+            common/security/Kconfig 2>/dev/null || true
+
+          echo "==> BBG installed successfully."
+
+      # -----------------------------------------------------------------------
+      # Phase 6: Prepare Config Fragment & Build
+      # -----------------------------------------------------------------------
+      - name: Prepare kernel config fragment
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          KERNEL_WORK="${{ github.workspace }}/kernel-work"
+
+          FRAGMENT="${{ github.workspace }}/config/android15-6.6-sukisu-susfs.fragment"
+          cp "$FRAGMENT" "$KERNEL_WORK/gki-sukisu-susfs.fragment"
+
+          echo "==> Features to be enabled:"
+          grep -E '^CONFIG_' "$KERNEL_WORK/gki-sukisu-susfs.fragment" | sort
+
+          # Remove ABI protected exports that conflict with SUSFS symbols
+          if [[ -f "$KERNEL_WORK/common/android/abi_gki_protected_exports_aarch64" ]]; then
+            echo "==> Removing ABI protected exports list..."
+            rm -f "$KERNEL_WORK/common/android/abi_gki_protected_exports_"*
+            if [[ -f "$KERNEL_WORK/common/BUILD.bazel" ]]; then
+              perl -0pi -e 's/\n\s*"protected_exports_list"\s*:\s*"android\/abi_gki_protected_exports_aarch64",//g' "$KERNEL_WORK/common/BUILD.bazel"
+            fi
+          fi
+
+      - name: Build GKI kernel with Bazel
+        timeout-minutes: 240
+        run: |
+          set -euo pipefail
+          KERNEL_WORK="${{ github.workspace }}/kernel-work"
+          OUT_DIR="${{ github.workspace }}/kernel-out"
+          mkdir -p "$OUT_DIR"
+
+          cd "$KERNEL_WORK"
+
+          # Copy fragment for Bazel
+          cp gki-sukisu-susfs.fragment common/arch/arm64/configs/gki-sukisu-susfs.fragment
+
+          echo "==> Disk space before build:"
+          df -h /
+
+          echo "==> Starting Bazel build..."
+          echo "    This may take 2-4 hours..."
+
+          JOBS=$(nproc)
+          if [[ "$JOBS" -gt 4 ]]; then
+            JOBS=4  # Limit to avoid OOM on GitHub Actions
+          fi
+
+          set +e
+          tools/bazel run \
+            --config=fast \
+            --lto=none \
+            --jobs="$JOBS" \
+            --local_ram_resources=HOST_RAM*.75 \
+            --verbose_failures \
+            --defconfig_fragment=//common:arch/arm64/configs/gki-sukisu-susfs.fragment \
+            //common:kernel_aarch64_dist \
+            -- \
+            --dist_dir="$OUT_DIR/dist" 2>&1 | tee "$OUT_DIR/bazel-build.log"
+          BAZEL_RC=${PIPESTATUS[0]}
+          set -e
+
+          if [[ "$BAZEL_RC" -ne 0 ]]; then
+            echo "==> Build FAILED. Collecting diagnostics..."
+            df -h || true
+            free -h || true
+
+            # Dump Bazel logs if any
+            find . -path '*/bazel-out/*' -type f \( -name '*.log' -o -name '*.err' \) -print -exec tail -200 {} \; 2>/dev/null | head -500 || true
+
+            echo "==> Tail of build log:"
+            tail -200 "$OUT_DIR/bazel-build.log" || true
+
+            exit 1
+          fi
+
+          echo "==> Build completed successfully!"
+          echo "==> Disk space after build:"
+          df -h /
+
+      # -----------------------------------------------------------------------
+      # Phase 7: Collect & Upload Artifacts
+      # -----------------------------------------------------------------------
+      - name: Collect build artifacts
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          OUT_DIR="${{ github.workspace }}/kernel-out"
+          ARTIFACT_DIR="${{ github.workspace }}/artifacts"
+          mkdir -p "$ARTIFACT_DIR"
+
+          echo "==> Finding build artifacts..."
+
+          # Find Image
+          IMAGE=$(find -L "$OUT_DIR" -type f -name Image 2>/dev/null | head -1 || true)
+          if [[ -n "$IMAGE" ]]; then
+            cp -v "$IMAGE" "$ARTIFACT_DIR/Image"
+            echo "Image found: $(ls -lh "$IMAGE" | awk '{print $5}')"
+          else
+            echo "WARNING: No Image found!"
+            find "$OUT_DIR" -type f 2>/dev/null | head -50 || true
+          fi
+
+          # Find config
+          CONFIG=$(find -L "$OUT_DIR" -type f \( -name '.config' -o -name '*defconfig*' \) 2>/dev/null | head -1 || true)
+          if [[ -n "$CONFIG" ]]; then
+            cp -v "$CONFIG" "$ARTIFACT_DIR/kernel.config"
+          fi
+
+          # Copy any .ko modules
+          find -L "$OUT_DIR" -type f -name '*.ko' -exec cp -v {} "$ARTIFACT_DIR/" \; 2>/dev/null || true
+
+          # Copy any .img files (boot.img, etc.)
+          find -L "$OUT_DIR" -type f -name '*.img' -exec cp -v {} "$ARTIFACT_DIR/" \; 2>/dev/null || true
+
+          # Save config fragment used
+          cp "${{ github.workspace }}/config/android15-6.6-sukisu-susfs.fragment" "$ARTIFACT_DIR/"
+
+          # Copy build log
+          if [[ -f "$OUT_DIR/bazel-build.log" ]]; then
+            cp "$OUT_DIR/bazel-build.log" "$ARTIFACT_DIR/"
+          fi
+
+          echo "==> Artifacts collected:"
+          ls -la "$ARTIFACT_DIR/"
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gki-kernel-sukisu-susfs-${{ env.TARGET_RELEASE }}
+          path: ${{ github.workspace }}/artifacts/*
+          retention-days: 30
+
+      - name: Verify enabled features
+        timeout-minutes: 2
+        run: |
+          ARTIFACT_DIR="${{ github.workspace }}/artifacts"
+          CONFIG_FILE="$ARTIFACT_DIR/kernel.config"
+
+          if [[ -f "$CONFIG_FILE" ]]; then
+            echo "================================================"
+            echo "  FEATURE VERIFICATION"
+            echo "================================================"
+            echo ""
+            echo "--- SukiSU KernelSU ---"
+            grep -E '^CONFIG_KSU=' "$CONFIG_FILE" || echo "  MISSING!"
+            echo ""
+            echo "--- SUSFS 2.0 ---"
+            grep -E '^CONFIG_KSU_SUSFS' "$CONFIG_FILE" || echo "  MISSING!"
+            echo ""
+            echo "--- IPSet / Netfilter ---"
+            grep -E '^CONFIG_IP_SET=|^CONFIG_NETFILTER_XT_SET=' "$CONFIG_FILE" || echo "  MISSING!"
+            echo ""
+            echo "--- BBRv1 TCP Congestion ---"
+            grep -E '^CONFIG_TCP_CONG_BBR|^CONFIG_DEFAULT_TCP_CONG' "$CONFIG_FILE" || echo "  MISSING!"
+            echo ""
+            echo "--- Baseband Guard ---"
+            grep -E '^CONFIG_BBG=' "$CONFIG_FILE" || echo "  MISSING!"
+            echo ""
+            echo "================================================"
+          else
+            echo "WARNING: No kernel config found for verification."
+          fi
+
+      - name: Build summary
+        run: |
+          ARTIFACT_DIR="${{ github.workspace }}/artifacts"
+          echo "================================================"
+          echo "  GKI KERNEL BUILD COMPLETE"
+          echo "================================================"
+          echo "Target: ${{ env.TARGET_RELEASE }}"
+          echo "Features:"
+          echo "  - SukiSU Ultra (v4.1.2/40545 compatible)"
+          echo "  - SUSFS 2.0 (inline hooks)"
+          echo "  - IPSet (advanced netfilter filtering)"
+          echo "  - BBRv1 TCP Congestion Control"
+          echo "  - Baseband Guard (BBG)"
+          echo ""
+          if [[ -f "$ARTIFACT_DIR/Image" ]]; then
+            echo "Kernel Image: $(ls -lh "$ARTIFACT_DIR/Image" | awk '{print $5}')"
+          fi
+          echo "================================================"
