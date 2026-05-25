@@ -247,8 +247,8 @@ jobs:
       # -----------------------------------------------------------------------
       # Phase 6: Prepare Config Fragment & Build
       # -----------------------------------------------------------------------
-      - name: Prepare kernel config fragment & fix BUILD.bazel
-        timeout-minutes: 10
+      - name: Prepare kernel config fragment
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           KERNEL_WORK="${{ github.workspace }}/kernel-work"
@@ -259,68 +259,18 @@ jobs:
           echo "==> Features to be enabled:"
           grep -E '^CONFIG_' "$KERNEL_WORK/gki-sukisu-susfs.fragment" | sort
 
-          # Remove ABI protected exports that conflict with SUSFS symbols
+          # Remove ABI protected exports that conflict with SUSFS symbols.
+          # SUSFS adds symbols that aren't in the GKI protected exports list,
+          # and the ABI check would reject them otherwise.
           if [[ -f "$KERNEL_WORK/common/android/abi_gki_protected_exports_aarch64" ]]; then
             echo "==> Removing ABI protected exports list..."
             rm -f "$KERNEL_WORK/common/android/abi_gki_protected_exports_"*
             if [[ -f "$KERNEL_WORK/common/BUILD.bazel" ]]; then
               perl -0pi -e 's/\n\s*"protected_exports_list"\s*:\s*"android\/abi_gki_protected_exports_aarch64",//g' "$KERNEL_WORK/common/BUILD.bazel"
+              echo "    Patched BUILD.bazel to remove protected_exports_list."
             fi
-          fi
-
-          # Preemptively add common netfilter/ipset modules to BUILD.bazel that our
-          # config may produce. This avoids the "undeclared modules" build error.
-          echo "==> Patching BUILD.bazel to declare additional modules..."
-          BUILD_BAZEL="$KERNEL_WORK/common/BUILD.bazel"
-          if [[ -f "$BUILD_BAZEL" ]]; then
-            # Install buildozer for programmatic BUILD file edits
-            if ! command -v buildozer &>/dev/null; then
-              echo "    Installing buildozer..."
-              curl -fsSL "https://github.com/bazelbuild/buildtools/releases/download/v7.3.1/buildozer-linux-amd64" \
-                -o /usr/local/bin/buildozer
-              chmod +x /usr/local/bin/buildozer
-            fi
-
-            # Declare modules that ipset/netfilter/BBG may produce when enabled.
-            # These are safe to add even if they don't get built; Kleaf will just
-            # skip them if the corresponding CONFIG option is disabled.
-            EXTRA_MODULES=(
-              # IPSet
-              "net/netfilter/ipset/ip_set.ko"
-              "net/netfilter/ipset/ip_set_bitmap_ip.ko"
-              "net/netfilter/ipset/ip_set_bitmap_ipmac.ko"
-              "net/netfilter/ipset/ip_set_bitmap_port.ko"
-              "net/netfilter/ipset/ip_set_hash_ip.ko"
-              "net/netfilter/ipset/ip_set_hash_ipmark.ko"
-              "net/netfilter/ipset/ip_set_hash_ipport.ko"
-              "net/netfilter/ipset/ip_set_hash_ipportip.ko"
-              "net/netfilter/ipset/ip_set_hash_ipportnet.ko"
-              "net/netfilter/ipset/ip_set_hash_ipmac.ko"
-              "net/netfilter/ipset/ip_set_hash_mac.ko"
-              "net/netfilter/ipset/ip_set_hash_net.ko"
-              "net/netfilter/ipset/ip_set_hash_netnet.ko"
-              "net/netfilter/ipset/ip_set_hash_netport.ko"
-              "net/netfilter/ipset/ip_set_hash_netportnet.ko"
-              "net/netfilter/ipset/ip_set_hash_netiface.ko"
-              "net/netfilter/ipset/ip_set_list_set.ko"
-              # XT matches/targets
-              "net/netfilter/xt_set.ko"
-              "net/netfilter/xt_addrtype.ko"
-              "net/netfilter/xt_recent.ko"
-              "net/netfilter/xt_LOG.ko"
-              # IPv6 NAT
-              "net/ipv6/netfilter/nf_nat_ipv6.ko"
-              "net/ipv6/netfilter/ip6t_MASQUERADE.ko"
-              "net/ipv6/netfilter/ip6table_nat.ko"
-              # BBG
-              "security/baseband_guard/baseband_guard.ko"
-            )
-
-            echo "    Adding ${#EXTRA_MODULES[@]} extra module declarations..."
-            for mod in "${EXTRA_MODULES[@]}"; do
-              buildozer "add module_outs $mod" //common:kernel_aarch64 2>/dev/null || true
-            done
-            echo "    BUILD.bazel updated."
+          else
+            echo "    No protected exports list found (OK)."
           fi
 
       - name: Build GKI kernel with Bazel
@@ -388,6 +338,15 @@ jobs:
           echo "==> Build completed successfully!"
           echo "==> Disk space after build:"
           df -h /
+
+      # Always upload the build log so we can diagnose failures without auth
+      - name: Upload build log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_id }}
+          path: ${{ github.workspace }}/kernel-out/bazel-build.log
+          retention-days: 7
 
       # -----------------------------------------------------------------------
       # Phase 7: Collect & Upload Artifacts
