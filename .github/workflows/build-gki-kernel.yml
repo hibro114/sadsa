@@ -206,6 +206,31 @@ jobs:
             fi
           done
 
+          # ---- Disable SukiSU UTS spoofing (SUSFS 2.0 provides its own) ----
+          # uts_spoof.c calls find_kernel_symbol_exact() which is undefined in
+          # GKI kernels and causes ld.lld link failure. SUSFS 2.0 has its own
+          # uname spoofing via CONFIG_KSU_SUSFS_SPOOF_UNAME, so SukiSU's
+          # version is redundant and must be removed from compilation.
+          echo "==> Disabling SukiSU UTS spoofing (SUSFS 2.0 handles this)..."
+          for _uts in KernelSU/kernel/feature/uts_spoof.c \
+                       common/drivers/kernelsu/feature/uts_spoof.c; do
+            if [[ -f "$_uts" ]]; then
+              mv "$_uts" "${_uts}.disabled"
+              echo "    Disabled: $_uts -> ${_uts}.disabled"
+            fi
+          done
+
+          # Also remove uts_spoof.o from any Kbuild/Makefile
+          for _mk in KernelSU/kernel/feature/Makefile \
+                      KernelSU/kernel/feature/Kbuild \
+                      KernelSU/kernel/Kbuild \
+                      KernelSU/kernel/Makefile; do
+            if [[ -f "$_mk" ]]; then
+              sed -i 's/.*uts_spoof\.o.*/# & (disabled - SUSFS 2.0 provides uname spoofing)/' "$_mk" 2>/dev/null || true
+              echo "    Patched Makefile: $_mk"
+            fi
+          done
+
           # ---- Patch Android Common Kernel ----
           echo "==> Applying SUSFS patches to Android common kernel..."
           cp susfs4ksu/kernel_patches/fs/* common/fs/ 2>/dev/null || true
